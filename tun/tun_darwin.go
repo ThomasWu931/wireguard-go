@@ -15,9 +15,17 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/conn"
 )
 
-const utunControlName = "com.apple.net.utun_control"
+const (
+	utunControlName = "com.apple.net.utun_control"
+
+	sysprotoControl          = 2  // SYSPROTO_CONTROL
+	utunOptMaxPendingPackets = 16 // UTUN_OPT_MAX_PENDING_PACKETS
+	utunMaxPendingPackets    = conn.IdealBatchSize
+	utunRecvBufferSize       = 8 << 20 // 8 MiB
+)
 
 type NativeTun struct {
 	name        string
@@ -26,6 +34,11 @@ type NativeTun struct {
 	errors      chan error
 	routeSocket int
 	closeOnce   sync.Once
+}
+
+type msghdrX struct {
+	unix.Msghdr
+	DataLen uintptr
 }
 
 func (tun *NativeTun) routineRouteListener(tunIfindex int) {
@@ -165,6 +178,15 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 
 	go tun.routineRouteListener(tunIfindex)
 
+	if err := tun.setMaxPendingPackets(utunMaxPendingPackets); err != nil {
+		tun.Close()
+		return nil, err
+	}
+	if err := tun.setRecvBuffer(utunRecvBufferSize); err != nil {
+		tun.Close()
+		return nil, err
+	}
+
 	if mtu > 0 {
 		err = tun.setMTU(mtu)
 		if err != nil {
@@ -205,21 +227,65 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 	// TODO: the BSDs look very similar in Read() and Write(). They should be
 	// collapsed, with platform-specific files containing the varying parts of
 	// their implementations.
+	if offset < 4 {
+		return 0, io.ErrShortBuffer
+	}
+
 	select {
 	case err := <-tun.errors:
 		return 0, err
 	default:
-		buf := bufs[0][offset-4:]
-		n, err := tun.tunFile.Read(buf[:])
-		if n < 4 {
+		msghdrs := make([]msghdrX, len(bufs))
+		for i, buf := range bufs {
+			buf = buf[offset-4:]
+			msghdrs[i].Iov = &unix.Iovec{Base: &buf[0], Len: uint64(len(buf))}
+			msghdrs[i].Iovlen = 1
+		}
+
+		conn, err := tun.tunFile.SyscallConn()
+		if err != nil {
 			return 0, err
 		}
-		sizes[0] = n - 4
-		return 1, err
+		var opErr error
+		var received int = 0
+		err = conn.Read(func(fd uintptr) bool {
+			rec, _, err := unix.Syscall6(
+				unix.SYS_RECVMSG_X,
+				fd,
+				uintptr(unsafe.Pointer(&msghdrs[0])),
+				uintptr(len(bufs)), // number of messages
+				0,                  // flags
+				0,                  // _
+				0,                  // _
+			)
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				return false
+			}
+			if err != 0 {
+				opErr = os.NewSyscallError("recvmsg_x", err)
+				return true
+			}
+			received = int(rec)
+			return true
+		})
+		if opErr != nil {
+			return received, opErr
+		}
+		if err != nil {
+			return received, err
+		}
+		for i := range received {
+			// Don't include AF header in buffer
+			sizes[i] = int(msghdrs[i].DataLen) - 4
+		}
+		return received, opErr
 	}
 }
 
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
+	msghdrs := make([]msghdrX, len(bufs))
+	totalSent := 0
+
 	if offset < 4 {
 		return 0, io.ErrShortBuffer
 	}
@@ -236,11 +302,44 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		default:
 			return i, unix.EAFNOSUPPORT
 		}
-		if _, err := tun.tunFile.Write(buf); err != nil {
-			return i, err
-		}
+		msghdrs[i].Iov = &unix.Iovec{Base: &buf[0], Len: uint64(len(buf))}
+		msghdrs[i].Iovlen = 1
 	}
-	return len(bufs), nil
+
+	conn, err := tun.tunFile.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var operr error
+	err = conn.Write(func(fd uintptr) bool {
+		for len(bufs)-totalSent > 0 {
+			sent, _, err := unix.Syscall6(
+				unix.SYS_SENDMSG_X,
+				fd,
+				uintptr(unsafe.Pointer(&msghdrs[totalSent])),
+				uintptr(len(bufs)-totalSent), // number of messages
+				0,                            // flags
+				0,                            // _
+				0,                            // _
+			)
+			totalSent += int(sent)
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				return false
+			}
+			if err != 0 {
+				operr = os.NewSyscallError("sendmsg_x", err)
+				return true
+			}
+		}
+		return true
+	})
+	if operr != nil {
+		return totalSent, operr
+	}
+	if err != nil {
+		return totalSent, err
+	}
+	return totalSent, nil
 }
 
 func (tun *NativeTun) Close() error {
@@ -258,6 +357,28 @@ func (tun *NativeTun) Close() error {
 		return err1
 	}
 	return err2
+}
+
+func (tun *NativeTun) setMaxPendingPackets(n int) error {
+	var err error
+	tun.operateOnFd(func(fd uintptr) {
+		err = unix.SetsockoptInt(int(fd), sysprotoControl, utunOptMaxPendingPackets, n)
+	})
+	if err != nil {
+		return fmt.Errorf("set UTUN_OPT_MAX_PENDING_PACKETS: %w", err)
+	}
+	return nil
+}
+
+func (tun *NativeTun) setRecvBuffer(n int) error {
+	var err error
+	tun.operateOnFd(func(fd uintptr) {
+		err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, n)
+	})
+	if err != nil {
+		return fmt.Errorf("set SO_RCVBUF: %w", err)
+	}
+	return nil
 }
 
 func (tun *NativeTun) setMTU(n int) error {
@@ -304,7 +425,7 @@ func (tun *NativeTun) MTU() (int, error) {
 }
 
 func (tun *NativeTun) BatchSize() int {
-	return 1
+	return conn.IdealBatchSize
 }
 
 func socketCloexec(family, sotype, proto int) (fd int, err error) {
