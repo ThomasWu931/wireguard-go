@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/darwinmsgx"
 )
 
 const (
@@ -34,11 +35,6 @@ type NativeTun struct {
 	errors      chan error
 	routeSocket int
 	closeOnce   sync.Once
-}
-
-type msghdrX struct {
-	unix.Msghdr
-	DataLen uintptr
 }
 
 func (tun *NativeTun) routineRouteListener(tunIfindex int) {
@@ -235,7 +231,7 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 	case err := <-tun.errors:
 		return 0, err
 	default:
-		msghdrs := make([]msghdrX, len(bufs))
+		msghdrs := make([]darwinmsgx.MsghdrX, len(bufs))
 		for i, buf := range bufs {
 			buf = buf[offset-4:]
 			msghdrs[i].Iov = &unix.Iovec{Base: &buf[0], Len: uint64(len(buf))}
@@ -246,49 +242,22 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 		if err != nil {
 			return 0, err
 		}
-		var opErr error
-		var received int = 0
-		err = conn.Read(func(fd uintptr) bool {
-			rec, _, err := unix.Syscall6(
-				unix.SYS_RECVMSG_X,
-				fd,
-				uintptr(unsafe.Pointer(&msghdrs[0])),
-				uintptr(len(bufs)), // number of messages
-				0,                  // flags
-				0,                  // _
-				0,                  // _
-			)
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				return false
-			}
-			if err != 0 {
-				opErr = os.NewSyscallError("recvmsg_x", err)
-				return true
-			}
-			received = int(rec)
-			return true
-		})
-		if opErr != nil {
-			return received, opErr
-		}
-		if err != nil {
-			return received, err
-		}
+		received, err := darwinmsgx.RecvmsgX(conn, msghdrs)
 		for i := range received {
 			// Don't include AF header in buffer
 			sizes[i] = int(msghdrs[i].DataLen) - 4
 		}
-		return received, opErr
+		return received, err
 	}
 }
 
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
-	msghdrs := make([]msghdrX, len(bufs))
-	totalSent := 0
-
 	if offset < 4 {
 		return 0, io.ErrShortBuffer
 	}
+
+	msghdrs := make([]darwinmsgx.MsghdrX, len(bufs))
+
 	for i, buf := range bufs {
 		buf = buf[offset-4:]
 		buf[0] = 0x00
@@ -310,36 +279,7 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	var operr error
-	err = conn.Write(func(fd uintptr) bool {
-		for len(bufs)-totalSent > 0 {
-			sent, _, err := unix.Syscall6(
-				unix.SYS_SENDMSG_X,
-				fd,
-				uintptr(unsafe.Pointer(&msghdrs[totalSent])),
-				uintptr(len(bufs)-totalSent), // number of messages
-				0,                            // flags
-				0,                            // _
-				0,                            // _
-			)
-			totalSent += int(sent)
-			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-				return false
-			}
-			if err != 0 {
-				operr = os.NewSyscallError("sendmsg_x", err)
-				return true
-			}
-		}
-		return true
-	})
-	if operr != nil {
-		return totalSent, operr
-	}
-	if err != nil {
-		return totalSent, err
-	}
-	return totalSent, nil
+	return darwinmsgx.SendmsgX(conn, msghdrs)
 }
 
 func (tun *NativeTun) Close() error {
