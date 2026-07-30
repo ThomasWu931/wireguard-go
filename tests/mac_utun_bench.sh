@@ -10,6 +10,10 @@
 #   WG_BIN=./wireguard-go TIME=30 PARALLEL=4 ./tests/mac_utun_bench.sh
 #   ./tests/mac_utun_bench.sh --udp
 #
+# CPU flame graphs (real Darwin utun + UDP):
+#   PROFILE=1 TIME=20 PARALLEL=2 ./tests/mac_utun_bench.sh --udp
+#   open ./utun-bench-a-flame.html
+#
 # Requires: sudo, wireguard-tools (wg), iperf3, Go (to build if WG_BIN missing).
 set -euo pipefail
 
@@ -20,6 +24,8 @@ TIME="${TIME:-10}"
 PARALLEL="${PARALLEL:-4}"
 UDP=0
 MTU="${MTU:-1420}"
+PROFILE="${PROFILE:-0}"
+PROFILE_OUT="${PROFILE_OUT:-$ROOT}"
 # Optional overrides; default is listen-port 0 (kernel-chosen ephemeral).
 PORT_A="${PORT_A:-0}"
 PORT_B="${PORT_B:-0}"
@@ -48,7 +54,7 @@ fi
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "==> re-running under sudo (utun requires root)"
-  exec sudo --preserve-env=WG_BIN,TIME,PARALLEL,MTU,PORT_A,PORT_B,IP_A,IP_B,KEEP,LOG_LEVEL,PATH,HOME "$0" "$@"
+  exec sudo --preserve-env=WG_BIN,TIME,PARALLEL,MTU,PORT_A,PORT_B,IP_A,IP_B,KEEP,LOG_LEVEL,WG_UDP_BATCH,PROFILE,PROFILE_OUT,PATH,HOME "$0" "$@"
 fi
 
 need() {
@@ -61,9 +67,19 @@ need wg wireguard-tools
 need iperf3 iperf3
 
 WG_BIN="${WG_BIN:-$ROOT/wireguard-go}"
-if [[ ! -x "$WG_BIN" ]]; then
+if [[ "$PROFILE" == "1" || ! -x "$WG_BIN" ]]; then
   echo "==> building wireguard-go"
   (cd "$ROOT" && go build -o "$WG_BIN" .)
+fi
+
+PROF_A=""
+PROF_B=""
+if [[ "$PROFILE" == "1" ]]; then
+  mkdir -p "$PROFILE_OUT"
+  PROF_A="$PROFILE_OUT/utun-bench-a.prof"
+  PROF_B="$PROFILE_OUT/utun-bench-b.prof"
+  rm -f "$PROF_A" "$PROF_B"
+  echo "==> CPU profiling enabled -> $PROF_A / $PROF_B"
 fi
 
 TMP="$(mktemp -d /tmp/wg-mac-bench.XXXXXX)"
@@ -103,10 +119,15 @@ wg genkey | tee "$KEY_A" | wg pubkey >"$PUB_A"
 wg genkey | tee "$KEY_B" | wg pubkey >"$PUB_B"
 
 echo "==> starting wireguard-go peers"
+echo "    WG_UDP_BATCH=${WG_UDP_BATCH:-1 (default on)}"
 WG_TUN_NAME_FILE="$NAME_A" LOG_LEVEL="${LOG_LEVEL:-error}" \
+  WG_UDP_BATCH="${WG_UDP_BATCH:-}" \
+  WG_CPUPROFILE="${PROF_A}" \
   "$WG_BIN" -f utun >"$LOG_A" 2>&1 &
 PID_A=$!
 WG_TUN_NAME_FILE="$NAME_B" LOG_LEVEL="${LOG_LEVEL:-error}" \
+  WG_UDP_BATCH="${WG_UDP_BATCH:-}" \
+  WG_CPUPROFILE="${PROF_B}" \
   "$WG_BIN" -f utun >"$LOG_B" 2>&1 &
 PID_B=$!
 
@@ -205,4 +226,48 @@ echo
 echo "Done (iperf exit=${rc})."
 echo "  interfaces: $IF_A <-> $IF_B"
 echo "  set KEEP=1 to preserve logs under $TMP"
+
+if [[ "$PROFILE" == "1" ]]; then
+  set +e
+  [[ -n "$PID_A" ]] && kill "$PID_A" 2>/dev/null
+  [[ -n "$PID_B" ]] && kill "$PID_B" 2>/dev/null
+  wait "$PID_A" "$PID_B" 2>/dev/null
+  PID_A=""
+  PID_B=""
+  set -e
+  sleep 0.3
+
+  write_flame_html() {
+    local peer="$1" prof="$2" html="$3" port="$4"
+    if [[ ! -s "$prof" ]]; then
+      echo "warning: empty profile $prof (peer $peer)" >&2
+      return 0
+    fi
+    echo "==> writing flame graph -> $html"
+    go tool pprof -top -nodecount=30 "$WG_BIN" "$prof" | tee "${prof%.prof}-top.txt"
+    go tool pprof -http="127.0.0.1:${port}" -no_browser "$WG_BIN" "$prof" >/dev/null 2>&1 &
+    local ppid=$!
+    local ok=0
+    for _ in $(seq 1 50); do
+      if curl -sf "http://127.0.0.1:${port}/ui/flamegraph" -o "$html"; then
+        ok=1
+        break
+      fi
+      sleep 0.1
+    done
+    kill "$ppid" 2>/dev/null || true
+    wait "$ppid" 2>/dev/null || true
+    if [[ "$ok" -ne 1 ]]; then
+      echo "warning: failed to fetch flame graph for peer $peer" >&2
+      echo "  try: go tool pprof -http=:8080 \"$WG_BIN\" \"$prof\"" >&2
+    fi
+  }
+
+  write_flame_html a "$PROF_A" "$PROFILE_OUT/utun-bench-a-flame.html" 18081
+  write_flame_html b "$PROF_B" "$PROFILE_OUT/utun-bench-b-flame.html" 18082
+  echo "  profiles: $PROF_A / $PROF_B"
+  echo "  flames:   $PROFILE_OUT/utun-bench-a-flame.html / $PROFILE_OUT/utun-bench-b-flame.html"
+  echo "  open \"$PROFILE_OUT/utun-bench-a-flame.html\""
+fi
+
 exit "$rc"

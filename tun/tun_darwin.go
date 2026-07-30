@@ -26,15 +26,21 @@ const (
 	utunOptMaxPendingPackets = 16 // UTUN_OPT_MAX_PENDING_PACKETS
 	utunMaxPendingPackets    = conn.IdealBatchSize
 	utunRecvBufferSize       = 8 << 20 // 8 MiB
+	batchSize                = 128
 )
 
 type NativeTun struct {
-	name        string
-	tunFile     *os.File
-	events      chan Event
-	errors      chan error
-	routeSocket int
-	closeOnce   sync.Once
+	name         string
+	tunFile      *os.File
+	events       chan Event
+	errors       chan error
+	routeSocket  int
+	closeOnce    sync.Once
+	writemsghdrs [batchSize]darwinmsgx.MsghdrX
+	writeiov     [batchSize]unix.Iovec
+	readmsghdrs  [batchSize]darwinmsgx.MsghdrX
+	readiov      [batchSize]unix.Iovec
+	writeLock    sync.Mutex // Need to lock on writes because multiple peers can write at the same time
 }
 
 func (tun *NativeTun) routineRouteListener(tunIfindex int) {
@@ -231,21 +237,22 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 	case err := <-tun.errors:
 		return 0, err
 	default:
-		msghdrs := make([]darwinmsgx.MsghdrX, len(bufs))
 		for i, buf := range bufs {
 			buf = buf[offset-4:]
-			msghdrs[i].Iov = &unix.Iovec{Base: &buf[0], Len: uint64(len(buf))}
-			msghdrs[i].Iovlen = 1
+			tun.readiov[i].Base = &buf[0]
+			tun.readiov[i].Len = uint64(len(buf))
+			tun.readmsghdrs[i].Iov = &tun.readiov[i]
+			tun.readmsghdrs[i].Iovlen = 1
 		}
 
 		conn, err := tun.tunFile.SyscallConn()
 		if err != nil {
 			return 0, err
 		}
-		received, err := darwinmsgx.RecvmsgX(conn, msghdrs)
+		received, err := darwinmsgx.RecvmsgX(conn, tun.readmsghdrs[:len(bufs)])
 		for i := range received {
 			// Don't include AF header in buffer
-			sizes[i] = int(msghdrs[i].DataLen) - 4
+			sizes[i] = int(tun.readmsghdrs[i].DataLen) - 4
 		}
 		return received, err
 	}
@@ -256,8 +263,9 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 
-	msghdrs := make([]darwinmsgx.MsghdrX, len(bufs))
-
+	tun.writeLock.Lock()
+	defer tun.writeLock.Unlock()
+	l := len(bufs)
 	for i, buf := range bufs {
 		buf = buf[offset-4:]
 		buf[0] = 0x00
@@ -271,15 +279,17 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		default:
 			return i, unix.EAFNOSUPPORT
 		}
-		msghdrs[i].Iov = &unix.Iovec{Base: &buf[0], Len: uint64(len(buf))}
-		msghdrs[i].Iovlen = 1
+		tun.writeiov[i].Base = &buf[0]
+		tun.writeiov[i].Len = uint64(len(buf))
+		tun.writemsghdrs[i].Iov = &tun.writeiov[i]
+		tun.writemsghdrs[i].Iovlen = 1
 	}
 
 	conn, err := tun.tunFile.SyscallConn()
 	if err != nil {
 		return 0, err
 	}
-	return darwinmsgx.SendmsgX(conn, msghdrs)
+	return darwinmsgx.SendmsgX(conn, tun.writemsghdrs[:l])
 }
 
 func (tun *NativeTun) Close() error {
@@ -365,7 +375,7 @@ func (tun *NativeTun) MTU() (int, error) {
 }
 
 func (tun *NativeTun) BatchSize() int {
-	return conn.IdealBatchSize
+	return batchSize
 }
 
 func socketCloexec(family, sotype, proto int) (fd int, err error) {

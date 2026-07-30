@@ -5,6 +5,8 @@ package conn
 import (
 	"encoding/binary"
 	"net"
+	"os"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/net/ipv6"
@@ -14,7 +16,34 @@ import (
 
 const stdNetBindBatches = true
 
+type darwinBatchConn struct {
+	conn         *net.UDPConn
+	readmsghdrs  [IdealBatchSize]darwinmsgx.MsghdrX
+	readsas      [IdealBatchSize]unix.RawSockaddrAny
+	readIovecs   [IdealBatchSize]unix.Iovec
+	writemsghdrs [IdealBatchSize]darwinmsgx.MsghdrX
+	writesa4s    [IdealBatchSize]unix.RawSockaddrInet4
+	writesa6s    [IdealBatchSize]unix.RawSockaddrInet6
+	writeIovecs  [IdealBatchSize]unix.Iovec
+	writelock    sync.Mutex
+}
+
+// udpBatchEnabled is true unless WG_UDP_BATCH=0 (or "false").
+// Used to A/B Darwin sendmsg_x/recvmsg_x against single-datagram UDP I/O
+// while leaving utun batching unchanged.
+func udpBatchEnabled() bool {
+	switch os.Getenv("WG_UDP_BATCH") {
+	case "0", "false", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 func (s *StdNetBind) setupBatch(v4conn, v6conn *net.UDPConn) {
+	if !udpBatchEnabled() {
+		return
+	}
 	if v4conn != nil {
 		s.batch4 = &darwinBatchConn{conn: v4conn}
 	}
@@ -23,41 +52,36 @@ func (s *StdNetBind) setupBatch(v4conn, v6conn *net.UDPConn) {
 	}
 }
 
-type darwinBatchConn struct {
-	conn *net.UDPConn
-}
-
 func (c *darwinBatchConn) ReadBatch(msgs []ipv6.Message, flags int) (int, error) {
 	if len(msgs) == 0 {
 		return 0, nil
 	}
 	_ = flags
 
-	msghdrs := make([]darwinmsgx.MsghdrX, len(msgs))
-	sas := make([]unix.RawSockaddrAny, len(msgs))
-
 	for i := range msgs {
 		buf := msgs[i].Buffers[0]
 		if len(buf) == 0 {
 			continue
 		}
-		msghdrs[i].Name = (*byte)(unsafe.Pointer(&sas[i]))
-		msghdrs[i].Namelen = uint32(unix.SizeofSockaddrAny)
-		msghdrs[i].Iov = &unix.Iovec{Base: &buf[0], Len: uint64(len(buf))}
-		msghdrs[i].Iovlen = 1
+		c.readmsghdrs[i].Name = (*byte)(unsafe.Pointer(&c.readsas[i]))
+		c.readmsghdrs[i].Namelen = uint32(unix.SizeofSockaddrAny)
+		c.readIovecs[i].Base = &buf[0]
+		c.readIovecs[i].Len = uint64(len(buf))
+		c.readmsghdrs[i].Iov = &c.readIovecs[i]
+		c.readmsghdrs[i].Iovlen = 1
 	}
 
 	rc, err := c.conn.SyscallConn()
 	if err != nil {
 		return 0, err
 	}
-	n, err := darwinmsgx.RecvmsgX(rc, msghdrs)
+	n, err := darwinmsgx.RecvmsgX(rc, c.readmsghdrs[:len(msgs)])
 	if err != nil {
 		return n, err
 	}
 	for i := 0; i < n; i++ {
-		msgs[i].N = int(msghdrs[i].DataLen)
-		msgs[i].Addr = sockaddrAnyToUDPAddr(&sas[i])
+		msgs[i].N = int(c.readmsghdrs[i].DataLen)
+		msgs[i].Addr = sockaddrAnyToUDPAddr(&c.readsas[i])
 	}
 	return n, nil
 }
@@ -67,45 +91,45 @@ func (c *darwinBatchConn) WriteBatch(msgs []ipv6.Message, flags int) (int, error
 		return 0, nil
 	}
 	_ = flags
-
-	msghdrs := make([]darwinmsgx.MsghdrX, len(msgs))
-	sa4s := make([]unix.RawSockaddrInet4, len(msgs))
-	sa6s := make([]unix.RawSockaddrInet6, len(msgs))
+	c.writelock.Lock()
+	defer c.writelock.Unlock()
 
 	for i, msg := range msgs {
 		addr := msg.Addr.(*net.UDPAddr)
 		if ip4 := addr.IP.To4(); ip4 != nil {
-			sa4s[i].Len = unix.SizeofSockaddrInet4
-			sa4s[i].Family = unix.AF_INET
-			p := (*[2]byte)(unsafe.Pointer(&sa4s[i].Port))
+			c.writesa4s[i].Len = unix.SizeofSockaddrInet4
+			c.writesa4s[i].Family = unix.AF_INET
+			p := (*[2]byte)(unsafe.Pointer(&c.writesa4s[i].Port))
 			p[0] = byte(addr.Port >> 8)
 			p[1] = byte(addr.Port)
-			copy(sa4s[i].Addr[:], ip4)
-			msghdrs[i].Name = (*byte)(unsafe.Pointer(&sa4s[i]))
-			msghdrs[i].Namelen = unix.SizeofSockaddrInet4
+			copy(c.writesa4s[i].Addr[:], ip4)
+			c.writemsghdrs[i].Name = (*byte)(unsafe.Pointer(&c.writesa4s[i]))
+			c.writemsghdrs[i].Namelen = unix.SizeofSockaddrInet4
 		} else {
 			ip6 := addr.IP.To16()
-			sa6s[i].Len = unix.SizeofSockaddrInet6
-			sa6s[i].Family = unix.AF_INET6
-			p := (*[2]byte)(unsafe.Pointer(&sa6s[i].Port))
+			c.writesa6s[i].Len = unix.SizeofSockaddrInet6
+			c.writesa6s[i].Family = unix.AF_INET6
+			p := (*[2]byte)(unsafe.Pointer(&c.writesa6s[i].Port))
 			p[0] = byte(addr.Port >> 8)
 			p[1] = byte(addr.Port)
-			copy(sa6s[i].Addr[:], ip6)
-			msghdrs[i].Name = (*byte)(unsafe.Pointer(&sa6s[i]))
-			msghdrs[i].Namelen = unix.SizeofSockaddrInet6
+			copy(c.writesa6s[i].Addr[:], ip6)
+			c.writemsghdrs[i].Name = (*byte)(unsafe.Pointer(&c.writesa6s[i]))
+			c.writemsghdrs[i].Namelen = unix.SizeofSockaddrInet6
 			// TODO: handle IPv6 zone / Scope_id
 		}
 
 		buf := msg.Buffers[0]
-		msghdrs[i].Iov = &unix.Iovec{Base: &buf[0], Len: uint64(len(buf))}
-		msghdrs[i].Iovlen = 1
+		c.writeIovecs[i].Base = &buf[0]
+		c.writeIovecs[i].Len = uint64(len(buf))
+		c.writemsghdrs[i].Iov = &c.writeIovecs[i]
+		c.writemsghdrs[i].Iovlen = 1
 	}
 
 	rc, err := c.conn.SyscallConn()
 	if err != nil {
 		return 0, err
 	}
-	return darwinmsgx.SendmsgX(rc, msghdrs)
+	return darwinmsgx.SendmsgX(rc, c.writemsghdrs[:len(msgs)])
 }
 
 func sockaddrAnyToUDPAddr(sa *unix.RawSockaddrAny) *net.UDPAddr {
