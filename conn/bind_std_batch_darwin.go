@@ -63,12 +63,16 @@ func (c *darwinBatchConn) ReadBatch(msgs []ipv6.Message, flags int) (int, error)
 		if len(buf) == 0 {
 			continue
 		}
-		c.readmsghdrs[i].Name = (*byte)(unsafe.Pointer(&c.readsas[i]))
-		c.readmsghdrs[i].Namelen = uint32(unix.SizeofSockaddrAny)
 		c.readIovecs[i].Base = &buf[0]
 		c.readIovecs[i].Len = uint64(len(buf))
-		c.readmsghdrs[i].Iov = &c.readIovecs[i]
-		c.readmsghdrs[i].Iovlen = 1
+		c.readmsghdrs[i] = darwinmsgx.MsghdrX{
+			Msghdr: unix.Msghdr{
+				Name:    (*byte)(unsafe.Pointer(&c.readsas[i])),
+				Namelen: uint32(unix.SizeofSockaddrAny),
+				Iov:     &c.readIovecs[i],
+				Iovlen:  1,
+			},
+		}
 	}
 
 	rc, err := c.conn.SyscallConn()
@@ -96,6 +100,8 @@ func (c *darwinBatchConn) WriteBatch(msgs []ipv6.Message, flags int) (int, error
 
 	for i, msg := range msgs {
 		addr := msg.Addr.(*net.UDPAddr)
+		var name *byte
+		var namelen uint32
 		if ip4 := addr.IP.To4(); ip4 != nil {
 			c.writesa4s[i].Len = unix.SizeofSockaddrInet4
 			c.writesa4s[i].Family = unix.AF_INET
@@ -103,8 +109,8 @@ func (c *darwinBatchConn) WriteBatch(msgs []ipv6.Message, flags int) (int, error
 			p[0] = byte(addr.Port >> 8)
 			p[1] = byte(addr.Port)
 			copy(c.writesa4s[i].Addr[:], ip4)
-			c.writemsghdrs[i].Name = (*byte)(unsafe.Pointer(&c.writesa4s[i]))
-			c.writemsghdrs[i].Namelen = unix.SizeofSockaddrInet4
+			name = (*byte)(unsafe.Pointer(&c.writesa4s[i]))
+			namelen = unix.SizeofSockaddrInet4
 		} else {
 			ip6 := addr.IP.To16()
 			c.writesa6s[i].Len = unix.SizeofSockaddrInet6
@@ -113,16 +119,22 @@ func (c *darwinBatchConn) WriteBatch(msgs []ipv6.Message, flags int) (int, error
 			p[0] = byte(addr.Port >> 8)
 			p[1] = byte(addr.Port)
 			copy(c.writesa6s[i].Addr[:], ip6)
-			c.writemsghdrs[i].Name = (*byte)(unsafe.Pointer(&c.writesa6s[i]))
-			c.writemsghdrs[i].Namelen = unix.SizeofSockaddrInet6
+			name = (*byte)(unsafe.Pointer(&c.writesa6s[i]))
+			namelen = unix.SizeofSockaddrInet6
 			// TODO: handle IPv6 zone / Scope_id
 		}
 
 		buf := msg.Buffers[0]
 		c.writeIovecs[i].Base = &buf[0]
 		c.writeIovecs[i].Len = uint64(len(buf))
-		c.writemsghdrs[i].Iov = &c.writeIovecs[i]
-		c.writemsghdrs[i].Iovlen = 1
+		c.writemsghdrs[i] = darwinmsgx.MsghdrX{
+			Msghdr: unix.Msghdr{
+				Name:    name,
+				Namelen: namelen,
+				Iov:     &c.writeIovecs[i],
+				Iovlen:  1,
+			},
+		}
 	}
 
 	rc, err := c.conn.SyscallConn()

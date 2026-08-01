@@ -241,8 +241,12 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 			buf = buf[offset-4:]
 			tun.readiov[i].Base = &buf[0]
 			tun.readiov[i].Len = uint64(len(buf))
-			tun.readmsghdrs[i].Iov = &tun.readiov[i]
-			tun.readmsghdrs[i].Iovlen = 1
+			tun.readmsghdrs[i] = darwinmsgx.MsghdrX{
+				Msghdr: unix.Msghdr{
+					Iov:    &tun.readiov[i],
+					Iovlen: 1,
+				},
+			}
 		}
 
 		conn, err := tun.tunFile.SyscallConn()
@@ -281,8 +285,12 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		}
 		tun.writeiov[i].Base = &buf[0]
 		tun.writeiov[i].Len = uint64(len(buf))
-		tun.writemsghdrs[i].Iov = &tun.writeiov[i]
-		tun.writemsghdrs[i].Iovlen = 1
+		tun.writemsghdrs[i] = darwinmsgx.MsghdrX{
+			Msghdr: unix.Msghdr{
+				Iov:    &tun.writeiov[i],
+				Iovlen: 1,
+			},
+		}
 	}
 
 	conn, err := tun.tunFile.SyscallConn()
