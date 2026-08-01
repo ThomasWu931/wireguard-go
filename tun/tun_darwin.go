@@ -25,7 +25,7 @@ const (
 	sysprotoControl          = 2  // SYSPROTO_CONTROL
 	utunOptMaxPendingPackets = 16 // UTUN_OPT_MAX_PENDING_PACKETS
 	utunMaxPendingPackets    = conn.IdealBatchSize
-	utunRecvBufferSize       = 8 << 20 // 8 MiB
+	utunRecvBufferSize       = 4 << 20 // 4 MiB
 	batchSize                = 128
 )
 
