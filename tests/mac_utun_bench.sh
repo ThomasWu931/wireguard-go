@@ -243,6 +243,29 @@ echo "Done (iperf exit=${rc})."
 echo "  interfaces: $IF_A <-> $IF_B"
 echo "  set KEEP=1 to preserve logs under $TMP"
 
+# UDP batch occupancy (need LOG_LEVEL=debug). Peer B is the iperf server side.
+# Print each histogram in full (until max_batch_size= footer), not a fixed -A window.
+dump_udp_recv_hist() {
+  awk '
+    /UDP recv/ { printing=1 }
+    printing {
+      print
+      if ($0 ~ /max_batch_size=/) { print ""; printing=0 }
+    }
+  ' "$1"
+}
+if grep -q 'UDP recv' "$LOG_A" "$LOG_B" 2>/dev/null; then
+  echo
+  echo "==> UDP recv batch stats (1s windows)"
+  echo "---- peer A (client / ${IP_A}) ----"
+  dump_udp_recv_hist "$LOG_A"
+  echo "---- peer B (server / ${IP_B}) ----"
+  dump_udp_recv_hist "$LOG_B"
+else
+  echo
+  echo "  tip: re-run with LOG_LEVEL=debug to print UDP recv batch sizes"
+fi
+
 if [[ "$PROFILE" == "1" ]]; then
   set +e
   [[ -n "$PID_A" ]] && kill "$PID_A" 2>/dev/null
