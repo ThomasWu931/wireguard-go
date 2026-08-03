@@ -26,7 +26,7 @@ const (
 	utunOptMaxPendingPackets = 16 // UTUN_OPT_MAX_PENDING_PACKETS
 	utunMaxPendingPackets    = conn.IdealBatchSize
 	utunRecvBufferSize       = 4 << 20 // 4 MiB
-	batchSize                = 128
+	batchSize                = 32
 )
 
 type NativeTun struct {
