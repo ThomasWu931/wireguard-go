@@ -9,6 +9,8 @@
 #   ./tests/mac_utun_bench.sh
 #   WG_BIN=./wireguard-go TIME=30 PARALLEL=4 ./tests/mac_utun_bench.sh
 #   ./tests/mac_utun_bench.sh --udp
+#   ./tests/mac_utun_bench.sh --udp -b 30M
+#   BANDWIDTH=30M ./tests/mac_utun_bench.sh --udp
 #
 # CPU flame graphs (real Darwin utun + UDP):
 #   PROFILE=1 TIME=20 PARALLEL=2 ./tests/mac_utun_bench.sh --udp
@@ -23,6 +25,8 @@ cd "$ROOT"
 TIME="${TIME:-10}"
 PARALLEL="${PARALLEL:-4}"
 UDP=0
+# UDP target bitrate for iperf3 -b (default 0 = as fast as possible).
+BANDWIDTH="${BANDWIDTH:-0}"
 MTU="${MTU:-1420}"
 PROFILE="${PROFILE:-0}"
 PROFILE_OUT="${PROFILE_OUT:-$ROOT}"
@@ -33,20 +37,6 @@ PORT_B="${PORT_B:-0}"
 IP_A="${IP_A:-10.77.77.1}"
 IP_B="${IP_B:-10.77.77.2}"
 
-for arg in "$@"; do
-  case "$arg" in
-    --udp) UDP=1 ;;
-    -h|--help)
-      sed -n '2,16p' "$0"
-      exit 0
-      ;;
-    *)
-      echo "unknown arg: $arg" >&2
-      exit 1
-      ;;
-  esac
-done
-
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "error: this script is for macOS (real utun)" >&2
   exit 1
@@ -54,8 +44,34 @@ fi
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "==> re-running under sudo (utun requires root)"
-  exec sudo --preserve-env=WG_BIN,TIME,PARALLEL,MTU,PORT_A,PORT_B,IP_A,IP_B,KEEP,LOG_LEVEL,WG_UDP_BATCH,PROFILE,PROFILE_OUT,PATH,HOME "$0" "$@"
+  exec sudo --preserve-env=WG_BIN,TIME,PARALLEL,BANDWIDTH,MTU,PORT_A,PORT_B,IP_A,IP_B,KEEP,LOG_LEVEL,WG_UDP_BATCH,PROFILE,PROFILE_OUT,PATH,HOME "$0" "$@"
 fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --udp) UDP=1 ;;
+    -b|--bandwidth)
+      if [[ $# -lt 2 ]]; then
+        echo "error: $1 requires a value (e.g. 30M, 1G, 0)" >&2
+        exit 1
+      fi
+      BANDWIDTH="$2"
+      shift
+      ;;
+    -b=*|--bandwidth=*)
+      BANDWIDTH="${1#*=}"
+      ;;
+    -h|--help)
+      sed -n '2,18p' "$0"
+      exit 0
+      ;;
+    *)
+      echo "unknown arg: $1" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -212,10 +228,10 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-echo "==> running iperf3 client → ${IP_B} (time=${TIME}s parallel=${PARALLEL} udp=${UDP})"
+echo "==> running iperf3 client → ${IP_B} (time=${TIME}s parallel=${PARALLEL} udp=${UDP} bandwidth=${BANDWIDTH})"
 set +e
 if [[ "$UDP" -eq 1 ]]; then
-  iperf3 -c "$IP_B" -B "$IP_A" -u -b 0 -t "$TIME" -P "$PARALLEL" | tee "$TMP/iperf-client.log"
+  iperf3 -c "$IP_B" -B "$IP_A" -u -b "$BANDWIDTH" -t "$TIME" -P "$PARALLEL" | tee "$TMP/iperf-client.log"
 else
   iperf3 -c "$IP_B" -B "$IP_A" -t "$TIME" -P "$PARALLEL" | tee "$TMP/iperf-client.log"
 fi
