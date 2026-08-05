@@ -15,7 +15,6 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/darwinmsgx"
 )
 
@@ -23,24 +22,21 @@ const (
 	utunControlName = "com.apple.net.utun_control"
 
 	sysprotoControl          = 2  // SYSPROTO_CONTROL
-	utunOptMaxPendingPackets = 16 // UTUN_OPT_MAX_PENDING_PACKETS
-	utunMaxPendingPackets    = conn.IdealBatchSize
+	utunOptMaxPendingPackets = 16 // setsockopt option name (UTUN_OPT_MAX_PENDING_PACKETS)
+	utunMaxPendingPackets    = 256
 	utunRecvBufferSize       = 4 << 20 // 4 MiB
 	batchSize                = 32
 )
 
 type NativeTun struct {
-	name         string
-	tunFile      *os.File
-	events       chan Event
-	errors       chan error
-	routeSocket  int
-	closeOnce    sync.Once
-	writemsghdrs [batchSize]darwinmsgx.MsghdrX
-	writeiov     [batchSize]unix.Iovec
-	readmsghdrs  [batchSize]darwinmsgx.MsghdrX
-	readiov      [batchSize]unix.Iovec
-	writeLock    sync.Mutex // Need to lock on writes because multiple peers can write at the same time
+	name        string
+	tunFile     *os.File
+	events      chan Event
+	errors      chan error
+	routeSocket int
+	closeOnce   sync.Once
+	readmsghdrs [batchSize]darwinmsgx.MsghdrX
+	readiov     [batchSize]unix.Iovec
 }
 
 func (tun *NativeTun) routineRouteListener(tunIfindex int) {
@@ -267,9 +263,9 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 
-	tun.writeLock.Lock()
-	defer tun.writeLock.Unlock()
 	l := len(bufs)
+	msghdrs := make([]darwinmsgx.MsghdrX, l)
+	iovecs := make([]unix.Iovec, l)
 	for i, buf := range bufs {
 		buf = buf[offset-4:]
 		buf[0] = 0x00
@@ -283,11 +279,11 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		default:
 			return i, unix.EAFNOSUPPORT
 		}
-		tun.writeiov[i].Base = &buf[0]
-		tun.writeiov[i].Len = uint64(len(buf))
-		tun.writemsghdrs[i] = darwinmsgx.MsghdrX{
+		iovecs[i].Base = &buf[0]
+		iovecs[i].Len = uint64(len(buf))
+		msghdrs[i] = darwinmsgx.MsghdrX{
 			Msghdr: unix.Msghdr{
-				Iov:    &tun.writeiov[i],
+				Iov:    &iovecs[i],
 				Iovlen: 1,
 			},
 		}
@@ -297,7 +293,7 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return darwinmsgx.SendmsgX(conn, tun.writemsghdrs[:l])
+	return darwinmsgx.SendmsgX(conn, msghdrs)
 }
 
 func (tun *NativeTun) Close() error {
